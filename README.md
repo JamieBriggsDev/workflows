@@ -31,13 +31,7 @@ jobs:
       TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
 ```
 
-| Secret | What it is |
-|---|---|
-| `DEPLOY_HOST` | The server's tailnet name |
-| `DEPLOY_USER` | The rrsync-restricted user |
-| `DEPLOY_SSH_KEY` | That user's private key |
-| `DEPLOY_KNOWN_HOSTS` | The pinned `known_hosts` line for `DEPLOY_HOST` |
-| `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET` | A Tailscale OAuth client that can write auth keys tagged `tag:ci` |
+Each input and secret is described in the workflow's `workflow_call` block.
 
 This repo is private, so its Actions access is set to "Accessible from repositories owned by the user".
 

@@ -50,7 +50,9 @@ jobs:
           name: ${{ inputs.artifact-name }}
           path: site
 
-      - uses: tailscale/github-action@v4
+      # Pinned, because it's handed the OAuth secret. Nodes it makes from an
+      # OAuth client are ephemeral, so they leave the tailnet after the run.
+      - uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -61,8 +63,9 @@ jobs:
           KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           KNOWN: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
+          umask 077
           mkdir -p ~/.ssh
-          printf '%s\n' "$KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$KEY" > ~/.ssh/deploy
           printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
 
       # The artifact's files all get fresh mtimes when it's unpacked, so
@@ -70,9 +73,9 @@ jobs:
       - name: rsync
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
-          DUSER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           TARGET: ${{ inputs.target-path }}
         run: |
           rsync -rlv --checksum --delete \
             -e "ssh -i $HOME/.ssh/deploy -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15" \
-            site/ "$DUSER@$HOST:$TARGET"
+            site/ "$DEPLOY_USER@$HOST:$TARGET"
