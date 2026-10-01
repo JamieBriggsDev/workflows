@@ -1,0 +1,78 @@
+# Deploys an already-built static site. The caller builds it and uploads it as
+# an artifact; this workflow knows nothing about how it was built.
+#
+# It joins the tailnet as an ephemeral node tagged tag:ci, then rsyncs the
+# artifact to a deploy user whose key is forced to run rrsync. With rrsync,
+# the remote path is relative to the folder in the forced command, so "/" is
+# the site folder itself.
+name: deploy-static
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: The artifact holding the built site. Its contents become the site root.
+        required: true
+        type: string
+      target-path:
+        description: Where to put the site, relative to the folder rrsync is restricted to ("/" for that folder itself).
+        required: true
+        type: string
+    secrets:
+      DEPLOY_HOST:
+        description: The server's tailnet name.
+        required: true
+      DEPLOY_USER:
+        description: The rrsync-restricted user.
+        required: true
+      DEPLOY_SSH_KEY:
+        description: That user's private key.
+        required: true
+      DEPLOY_KNOWN_HOSTS:
+        description: The pinned known_hosts line for DEPLOY_HOST.
+        required: true
+      TS_OAUTH_CLIENT_ID:
+        description: Tailscale OAuth client allowed to make tag:ci auth keys.
+        required: true
+      TS_OAUTH_SECRET:
+        description: Its secret.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: site
+
+      - uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: SSH key and pinned host key
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+
+      # The artifact's files all get fresh mtimes when it's unpacked, so
+      # --checksum decides what changed; otherwise every file is resent.
+      - name: rsync
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          DUSER: ${{ secrets.DEPLOY_USER }}
+          TARGET: ${{ inputs.target-path }}
+        run: |
+          rsync -rlv --checksum --delete \
+            -e "ssh -i $HOME/.ssh/deploy -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15" \
+            site/ "$DUSER@$HOST:$TARGET"
