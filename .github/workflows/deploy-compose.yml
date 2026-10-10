@@ -1,0 +1,141 @@
+# Deploys a Docker Compose app whose images the caller has already built and
+# pushed to GHCR. This workflow knows nothing about how they were built.
+#
+# It joins the tailnet as an ephemeral node tagged tag:ci, then SSHes in as a
+# deploy user whose key is forced to run server/deploy-compose. On stdin it
+# sends a tar of the compose file, a .env (IMAGE_TAG plus the environment's
+# secrets) and the GHCR login. The script pulls, then runs `up --detach`.
+#
+# The caller must pass `secrets: inherit`: environment secrets only reach a
+# reusable workflow that way or by name, and this one sends every secret it can
+# see except its own: repo and org secrets too, not just the environment's.
+name: deploy-compose
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: The caller's GitHub environment. Its secrets, with any other secret the caller passes, become the .env on the server.
+        required: true
+        type: string
+      image-tag:
+        description: The tag the compose file's images use, as ${IMAGE_TAG}. Usually the commit SHA.
+        required: true
+        type: string
+      compose-file:
+        description: The compose file to deploy, as a path in the caller's repo. It is saved as compose.yaml on the server.
+        required: true
+        type: string
+      registry-username:
+        description: The GHCR user that GHCR_TOKEN belongs to. Defaults to the repository owner.
+        required: false
+        type: string
+    # All of these come through `secrets: inherit`, from the repo or from the
+    # environment. They're optional here because a required secret that lives
+    # only in the environment fails the call; the Bundle step checks them.
+    secrets:
+      DEPLOY_HOST:
+        description: The server's tailnet name.
+        required: false
+      DEPLOY_USER:
+        description: The user whose key is forced to run deploy-compose.
+        required: false
+      DEPLOY_SSH_KEY:
+        description: That user's private key.
+        required: false
+      DEPLOY_KNOWN_HOSTS:
+        description: The pinned known_hosts line for DEPLOY_HOST.
+        required: false
+      TS_OAUTH_CLIENT_ID:
+        description: Tailscale OAuth client allowed to make tag:ci auth keys.
+        required: false
+      TS_OAUTH_SECRET:
+        description: Its secret.
+        required: false
+      GHCR_TOKEN:
+        description: A token with read:packages, which the server logs in to GHCR with.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    # One deploy per environment at a time. A running deploy is never cancelled.
+    concurrency:
+      group: deploy-compose-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: ${{ inputs.compose-file }}
+          sparse-checkout-cone-mode: false
+
+      # Single quotes make .env values literal to docker compose, newlines
+      # included, so a value can't hold a ' or end in a \. Those fail here,
+      # naming the secret but not its value, as do COMPOSE_* names, which
+      # would steer compose itself rather than reach the app.
+      - name: Bundle
+        env:
+          SECRETS: ${{ toJSON(secrets) }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          COMPOSE_FILE: ${{ inputs.compose-file }}
+          REGISTRY_USERNAME: ${{ inputs.registry-username || github.repository_owner }}
+        run: |
+          # The deploy's own secrets, which it needs and keeps out of .env.
+          own='["DEPLOY_HOST", "DEPLOY_USER", "DEPLOY_SSH_KEY", "DEPLOY_KNOWN_HOSTS",
+                "TS_OAUTH_CLIENT_ID", "TS_OAUTH_SECRET", "GHCR_TOKEN"]'
+          missing=$(jq -r --argjson own "$own" '$own - (to_entries | map(select(.value != "") | .key)) | join(" ")' <<<"$SECRETS")
+          if [[ -n "$missing" ]]; then
+            echo "::error::Missing secrets: $missing. Does the caller pass secrets: inherit?"
+            exit 1
+          fi
+
+          umask 077
+          mkdir bundle
+          cp -- "$COMPOSE_FILE" bundle/compose.yaml
+          {
+            printf "IMAGE_TAG='%s'\n" "$IMAGE_TAG"
+            jq -r --argjson own "$own" '
+              ([39] | implode) as $q  # a single quote
+              | ($own + ["github_token", "IMAGE_TAG"]) as $skip
+              | to_entries | map(select(.key as $k | $skip | index($k) | not)) | sort_by(.key) | .[]
+              | if (.key | startswith("COMPOSE_")) then
+                  error("\(.key) would configure docker compose itself; rename it")
+                elif (.value | contains($q)) or (.value | endswith("\\")) then
+                  error("\(.key) holds a single quote or ends in a backslash, which .env cannot carry")
+                else "\(.key)=\($q)\(.value)\($q)" end
+            ' <<<"$SECRETS"
+          } > bundle/.env
+          printf '%s\n%s\n' "$REGISTRY_USERNAME" "$(jq -r .GHCR_TOKEN <<<"$SECRETS")" > bundle/ghcr-login
+          tar -C bundle -cf bundle.tar compose.yaml .env ghcr-login
+
+      # Pinned, because it's handed the OAuth secret. Nodes it makes from an
+      # OAuth client are ephemeral, so they leave the tailnet after the run.
+      - uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: SSH key and pinned host key
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy
+          printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+
+      # The key's forced command ignores what we ask to run; it reads the bundle.
+      - name: Deploy
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -T -i ~/.ssh/deploy -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 \
+            "$DEPLOY_USER@$HOST" < bundle.tar

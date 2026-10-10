@@ -1,0 +1,40 @@
+#!/bin/sh
+# The forced command for a deploy-compose user. Install it on the server and
+# lock the deploy key to it in that user's authorized_keys:
+#
+#   command="/usr/local/bin/deploy-compose /srv/<app>",restrict ssh-ed25519 AAAA...
+#
+# The deploy-compose workflow sends a tar on stdin holding compose.yaml, .env
+# and ghcr-login (username, then token). This unpacks them, pulls the images
+# with them, then puts them in the app dir and starts the stack. The live
+# files are only replaced once the pull has worked.
+#
+# Whoever holds the key can run any compose file, so this does no more than
+# that. Keep it that way: tiny, and reviewed.
+set -eu
+umask 077
+
+app=$1
+stage=$app/.deploy
+
+rm -rf "$stage"
+mkdir "$stage"
+trap 'rm -rf "$stage"' EXIT
+
+tar -x -C "$stage" -f - compose.yaml .env ghcr-login
+for f in compose.yaml .env ghcr-login; do
+  if [ -L "$stage/$f" ] || [ ! -f "$stage/$f" ]; then
+    echo "deploy-compose: $f is not a plain file" >&2
+    exit 1
+  fi
+done
+
+{ read -r user; read -r token; } < "$stage/ghcr-login"
+printf '%s' "$token" | docker login ghcr.io --username "$user" --password-stdin
+
+docker compose --project-directory "$app" --file "$stage/compose.yaml" --env-file "$stage/.env" pull
+
+mv "$stage/compose.yaml" "$app/compose.yaml"
+mv "$stage/.env" "$app/.env"
+
+docker compose --project-directory "$app" --file "$app/compose.yaml" --env-file "$app/.env" up --detach --remove-orphans
