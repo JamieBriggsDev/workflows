@@ -31,12 +31,14 @@ else
 fi
 EOF
   # `issue list` prints the titles it holds as JSON, whatever the search,
-  # closed ones only with --state all; `issue create` adds an open one and
-  # logs it, with its label and body.
+  # closed ones only with --state all, and fails if the search names
+  # $GH_FAIL_ON; `issue create` adds an open one and logs it, with its label
+  # and body.
   cat > "$work/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 case "$1 $2" in
   "issue list")
+    [[ -n "${GH_FAIL_ON:-}" && "$*" == *"$GH_FAIL_ON"* ]] && exit 1
     states=open
     [[ "$*" == *"--state all"* ]] && states="open closed"
     jq -R --arg states "$states" 'capture("^(?<state>\\S+) (?<title>.*)$")
@@ -135,6 +137,13 @@ YAML
   assert_eq "$(cut -d' ' -f2- "$work/issues")" "Postgres 18 is available: plan the upgrade" "issues"
 }
 
+test_an_image_pinned_by_digest_is_checked_by_its_tag() {
+  printf 'services:\n  db:\n    image: postgres:17@sha256:0123abcd\n' > "$work/caller/compose.yaml"
+  printf 'library/postgres:18\n' > "$work/hub"
+  watch compose.yaml || fail "exit status $? ($(cat "$work/out"))"
+  assert_eq "$(cut -d' ' -f2- "$work/issues")" "Postgres 18 is available: plan the upgrade" "issues"
+}
+
 test_ignored_images_are_not_checked() {
   printf 'services:\n  db:\n    image: postgres:17\n  q:\n    image: docker.io/rabbitmq:3\n' > "$work/caller/compose.yaml"
   printf 'library/postgres:18\nlibrary/rabbitmq:4\n' > "$work/hub"
@@ -164,6 +173,14 @@ test_a_docker_hub_error_fails_the_run_after_checking_the_rest() {
   printf 'library/mariadb:11\nlibrary/postgres:18\n' > "$work/hub"
   HUB_DOWN=library/mariadb watch compose.yaml && fail "exit status 0"
   grep -qF '::error::Docker Hub answered 503 for library/mariadb:11' "$work/out" || fail "no error: $(cat "$work/out")"
+  assert_eq "$(cut -d' ' -f2- "$work/issues")" "Postgres 18 is available: plan the upgrade" "issues"
+}
+
+test_a_github_error_fails_the_run_after_checking_the_rest() {
+  printf 'services:\n  a:\n    image: mariadb:10\n  b:\n    image: postgres:17\n' > "$work/caller/compose.yaml"
+  printf 'library/mariadb:11\nlibrary/postgres:18\n' > "$work/hub"
+  GH_FAIL_ON=Mariadb watch compose.yaml && fail "exit status 0"
+  grep -qF '::error::Could not search issues for "Mariadb 11' "$work/out" || fail "no error: $(cat "$work/out")"
   assert_eq "$(cut -d' ' -f2- "$work/issues")" "Postgres 18 is available: plan the upgrade" "issues"
 }
 

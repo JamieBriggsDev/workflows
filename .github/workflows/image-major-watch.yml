@@ -31,15 +31,22 @@ permissions:
 jobs:
   watch:
     runs-on: ubuntu-latest
+    # One watch per repo at a time, so overlapping runs can't both raise
+    # the same issue.
+    concurrency:
+      group: image-major-watch-${{ github.repository }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          sparse-checkout: ${{ inputs.compose-files }}
+          sparse-checkout-cone-mode: false
 
       # Only images on Docker Hub with a purely numeric tag can be checked:
       # the next major is that number plus one, and it exists if Docker Hub
       # has that tag. Anything else is skipped with a warning. A Docker Hub
-      # error fails the run, after the other images are checked.
+      # or GitHub error fails the run, after the other images are checked.
       - name: Watch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -47,8 +54,8 @@ jobs:
           COMPOSE_FILES: ${{ inputs.compose-files }}
           IGNORE: ${{ inputs.ignore }}
         run: |
-          read -d '' -ra files <<<"$COMPOSE_FILES" || true
-          read -d '' -ra ignored <<<"$IGNORE" || true
+          mapfile -t files < <(grep -v '^[[:space:]]*$' <<<"$COMPOSE_FILES" || true)
+          mapfile -t ignored < <(grep -v '^[[:space:]]*$' <<<"$IGNORE" || true)
           declare -A pinned_in opened
           for f in "${files[@]}"; do
             [[ -f "$f" ]] || { echo "::error::No compose file at $f"; exit 1; }
@@ -62,11 +69,13 @@ jobs:
               "https://hub.docker.com/v2/repositories/$1/tags/$2" || true
           }
 
-          errors=0
-          for image in $(printf '%s\n' "${!pinned_in[@]}" | sort); do
-            name=$image tag=''
-            if [[ "${image##*/}" == *:* ]]; then
-              name=${image%:*} tag=${image##*:}
+          errors=0 labelled=''
+          mapfile -t images < <(printf '%s\n' "${!pinned_in[@]}" | sort)
+          for image in "${images[@]}"; do
+            # A digest pins the image exactly, but the tag still names its major.
+            name=${image%%@*} tag=''
+            if [[ "${name##*/}" == *:* ]]; then
+              tag=${name##*:} name=${name%:*}
             fi
             repo=${name#docker.io/}
             repo=${repo#index.docker.io/}
@@ -114,20 +123,31 @@ jobs:
             title="$display $latest is available: plan the upgrade"
             [[ -z "${opened[$title]:-}" ]] || continue
             opened[$title]=1
-            known=$(gh issue list --state all --limit 100 --search "\"$title\" in:title" --json title |
-              jq --arg t "$title" 'map(select(.title == $t)) | length')
-            if ((known)); then
+            if ! known=$(gh issue list --state all --limit 100 --search "\"$title\" in:title" --json title |
+              jq --arg t "$title" 'map(select(.title == $t)) | length'); then
+              echo "::error::Could not search issues for \"$title\""
+              errors=1
+              continue
+            elif ((known)); then
               echo "Already raised: $title"
               continue
             fi
 
-            gh label create needs-triage --color fbca04 \
-              --description "Maintainer needs to evaluate this issue" > /dev/null 2>&1 || true
-            gh issue create --title "$title" --label needs-triage --body "Docker Hub has \`$short:$latest\`. This repo pins \`$image\` in ${pinned_in[$image]}.
+            if [[ -z "$labelled" ]]; then
+              # Fails harmlessly if the label exists; issue create reports anything worse.
+              gh label create needs-triage --color fbca04 \
+                --description "Maintainer needs to evaluate this issue" > /dev/null 2>&1 || true
+              labelled=1
+            fi
+            if ! gh issue create --title "$title" --label needs-triage --body "Docker Hub has \`$short:$latest\`. This repo pins \`$image\` in ${pinned_in[$image]}.
 
           Major upgrades of this image need manual work, such as a data migration, so they're left out of automatic updates. Plan this one by hand.
 
-          Close this issue once it's done or decided against. It won't be raised again; the next major gets an issue of its own."
+          Close this issue once it's done or decided against. It won't be raised again; the next major gets an issue of its own."; then
+              echo "::error::Could not raise \"$title\""
+              errors=1
+              continue
+            fi
             echo "Raised: $title"
           done
           exit "$errors"

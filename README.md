@@ -88,7 +88,7 @@ It reads every `image:` in the given compose files. For each one whose tag is a 
 
 If an issue with that exact title already exists, open or closed, it does nothing. Close the issue once you've upgraded or decided not to; the next major has a new title, so it gets a new issue. The issues are its only state.
 
-Images it can't check are skipped with a warning and the run still passes: images from other registries, tags that aren't a plain number (`17-alpine`, `latest`, no tag), and tags set by a variable. A Docker Hub error fails the run, after the other images are checked.
+Images it can't check are skipped with a warning and the run still passes: images from other registries, tags that aren't a plain number (`17-alpine`, `latest`, no tag), and tags set by a variable. A digest after the tag is fine: `postgres:17@sha256:…` is checked as `postgres:17`. A Docker Hub or GitHub error fails the run, after the other images are checked.
 
 ```yaml
 on:
@@ -110,14 +110,13 @@ jobs:
         grafana/grafana
 ```
 
-- `compose-files`: paths in the caller's repo, one per line.
-- `ignore`: optional images not to check, one per line, by name without the tag, e.g. `postgres` or `grafana/grafana`.
+Each input is described in the workflow's `workflow_call` block.
 
-It runs with the caller's `GITHUB_TOKEN`, which needs `issues: write`. If the repo has no `needs-triage` label, the workflow creates one.
+It runs with the caller's `GITHUB_TOKEN`, so the calling job must grant `issues: write` and `contents: read`, as above. If the repo has no `needs-triage` label, the workflow creates one.
 
 ### Tests
 
-`test/image-major-watch.test.sh` runs the workflow's `Watch` step in a fake caller checkout, with a fake Docker Hub (`curl`) and a fake issue tracker (`gh`). It needs `bash`, `jq` and `python3` with PyYAML.
+`test/image-major-watch.test.sh` runs the workflow's `Watch` step in a fake caller checkout, with a fake Docker Hub (`curl`) and a fake issue tracker (`gh`). It needs `bash`, `jq`, and `python3` with PyYAML.
 
 ## Access and versions
 
