@@ -80,9 +80,46 @@ The `docker` group is effectively root, and whoever holds the key can run any co
 
 `test/deploy-compose.test.sh` runs the workflow's `Bundle` step against fake secrets, feeds the result to the script with a fake `docker`, and checks the `.env` against the real `docker compose` when one is installed. It needs `bash`, `jq`, GNU `tar`, and `python3` with PyYAML.
 
+## `image-major-watch.yml`
+
+Warns a repo when a Docker image it pins by major version, like `postgres:17` or `redis:7`, has a newer major on Docker Hub. Those majors need manual work, such as a data migration, so Dependabot is told to ignore them; this is how the repo still hears about them.
+
+It reads every `image:` in the given compose files. For each one whose tag is a number, it checks Docker Hub for the next majors and opens one issue in the calling repo for the newest, titled e.g. "Postgres 18 is available: plan the upgrade" and labelled `needs-triage`. Official images get a capitalised name; others keep their namespace, e.g. "grafana/grafana 12 is available: plan the upgrade".
+
+If an issue with that exact title already exists, open or closed, it does nothing. Close the issue once you've upgraded or decided not to; the next major has a new title, so it gets a new issue. The issues are its only state.
+
+Images it can't check are skipped with a warning and the run still passes: images from other registries, tags that aren't a plain number (`17-alpine`, `latest`, no tag), and tags set by a variable. A digest after the tag is fine: `postgres:17@sha256:…` is checked as `postgres:17`. A Docker Hub or GitHub error fails the run, after the other images are checked.
+
+```yaml
+on:
+  schedule:
+    - cron: '0 7 * * 1'   # Mondays
+  workflow_dispatch:
+
+jobs:
+  watch:
+    permissions:
+      contents: read
+      issues: write
+    uses: JamieBriggsDev/workflows/.github/workflows/image-major-watch.yml@v1
+    with:
+      compose-files: |
+        compose.yaml
+        deploy/compose.prod.yaml
+      ignore: |                # optional
+        grafana/grafana
+```
+
+Each input is described in the workflow's `workflow_call` block.
+
+It runs with the caller's `GITHUB_TOKEN`, so the calling job must grant `issues: write` and `contents: read`, as above. If the repo has no `needs-triage` label, the workflow creates one.
+
+### Tests
+
+`test/image-major-watch.test.sh` runs the workflow's `Watch` step in a fake caller checkout, with a fake Docker Hub (`curl`) and a fake issue tracker (`gh`). It needs `bash`, `jq`, and `python3` with PyYAML.
 
 ## Access and versions
 
-This repo is private, so its Actions access is set to "Accessible from repositories owned by the user".
+This repo is public, so any repository can call its workflows.
 
 `v1` is a moving major tag. Move it forward for backward-compatible fixes, and cut `v2` for breaking changes.
