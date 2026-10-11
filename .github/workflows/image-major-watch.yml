@@ -1,0 +1,133 @@
+# Warns the calling repo when a Docker image it pins by major version (e.g.
+# postgres:17) has a newer major on Docker Hub. Major upgrades of such images
+# need manual work, like a data migration, so Dependabot is told to skip them;
+# this is how the repo still hears about them.
+#
+# For each image with a newer major it opens one issue in the caller, titled
+# e.g. "Postgres 18 is available: plan the upgrade". If an issue with that
+# exact title exists, open or closed, it stays quiet: closing one means "seen,
+# decided". The issues it has opened are its only state.
+#
+# The caller must grant `permissions: issues: write`.
+name: image-major-watch
+
+on:
+  workflow_call:
+    inputs:
+      compose-files:
+        description: The compose files to scan, as paths in the caller's repo, one per line.
+        required: true
+        type: string
+      ignore:
+        description: Images not to check, one per line, by name without a tag, e.g. postgres or grafana/grafana.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Only images on Docker Hub with a purely numeric tag can be checked:
+      # the next major is that number plus one, and it exists if Docker Hub
+      # has that tag. Anything else is skipped with a warning. A Docker Hub
+      # error fails the run, after the other images are checked.
+      - name: Watch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMPOSE_FILES: ${{ inputs.compose-files }}
+          IGNORE: ${{ inputs.ignore }}
+        run: |
+          read -d '' -ra files <<<"$COMPOSE_FILES" || true
+          read -d '' -ra ignored <<<"$IGNORE" || true
+          declare -A pinned_in opened
+          for f in "${files[@]}"; do
+            [[ -f "$f" ]] || { echo "::error::No compose file at $f"; exit 1; }
+            while read -r image; do
+              pinned_in[$image]+="${pinned_in[$image]:+, }\`$f\`"
+            done < <(sed -nE "s/^[[:space:]]*image:[[:space:]]*[\"']?([^\"'#[:space:]]+).*/\1/p" "$f")
+          done
+
+          hub_status() {
+            curl -s -o /dev/null -w '%{http_code}' --retry 3 \
+              "https://hub.docker.com/v2/repositories/$1/tags/$2" || true
+          }
+
+          errors=0
+          for image in $(printf '%s\n' "${!pinned_in[@]}" | sort); do
+            name=$image tag=''
+            if [[ "${image##*/}" == *:* ]]; then
+              name=${image%:*} tag=${image##*:}
+            fi
+            repo=${name#docker.io/}
+            repo=${repo#index.docker.io/}
+            repo=${repo#registry-1.docker.io/}
+            repo=${repo#library/}
+
+            for i in "${ignored[@]}"; do
+              [[ "$i" == "$name" || "$i" == "$repo" ]] && continue 2
+            done
+            first=${repo%%/*}
+            if [[ "$image" == *'$'* ]]; then
+              echo "::warning::Skipping $image: it is set by a variable"
+              continue
+            elif [[ "$repo" == */* && ( "$first" == *.* || "$first" == *:* || "$first" == localhost ) ]]; then
+              echo "::warning::Skipping $image: only Docker Hub images can be checked"
+              continue
+            elif [[ ! "$tag" =~ ^[0-9]+$ ]]; then
+              echo "::warning::Skipping $image: its tag is not a numeric major"
+              continue
+            fi
+            [[ "$repo" == */* ]] || repo=library/$repo
+
+            # Probe upwards until Docker Hub says no, so a repo several majors
+            # behind hears about the newest one.
+            latest='' next=$((10#$tag + 1))
+            while :; do
+              status=$(hub_status "$repo" "$next")
+              case $status in
+                200) latest=$next next=$((next + 1)) ;;
+                404) break ;;
+                *)
+                  echo "::error::Docker Hub answered ${status:-nothing} for $repo:$next; $image was not checked"
+                  errors=1 latest=''
+                  break
+                  ;;
+              esac
+            done
+            [[ -n "$latest" ]] || continue
+
+            # Official images read as products ("Postgres"); others keep their
+            # namespace, so bitnami/redis and redis don't share a title.
+            short=${repo#library/}
+            display=$short
+            [[ "$repo" == library/* ]] && display=${short^}
+            title="$display $latest is available: plan the upgrade"
+            [[ -z "${opened[$title]:-}" ]] || continue
+            opened[$title]=1
+            known=$(gh issue list --state all --limit 100 --search "\"$title\" in:title" --json title |
+              jq --arg t "$title" 'map(select(.title == $t)) | length')
+            if ((known)); then
+              echo "Already raised: $title"
+              continue
+            fi
+
+            gh label create needs-triage --color fbca04 \
+              --description "Maintainer needs to evaluate this issue" > /dev/null 2>&1 || true
+            gh issue create --title "$title" --label needs-triage --body "Docker Hub has \`$short:$latest\`. This repo pins \`$image\` in ${pinned_in[$image]}.
+
+          Major upgrades of this image need manual work, such as a data migration, so they're left out of automatic updates. Plan this one by hand.
+
+          Close this issue once it's done or decided against. It won't be raised again; the next major gets an issue of its own."
+            echo "Raised: $title"
+          done
+          exit "$errors"
